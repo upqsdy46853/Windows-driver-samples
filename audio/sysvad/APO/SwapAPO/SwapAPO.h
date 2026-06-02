@@ -242,6 +242,26 @@ public:
     ,   m_fEnableSwapSFX(FALSE)
     ,   m_fEnableDelaySFX(FALSE)
     {
+        m_StreamId = 0;
+        m_ApoProcessCallCount = 0;
+        m_TotalFramesProcessed = 0;
+        m_StreamStartTick = 0;
+        m_FirstProcessQpc = 0;
+        m_LastProcessQpc = 0;
+        m_InputDumpFile = INVALID_HANDLE_VALUE;
+        m_OutputDumpFile = INVALID_HANDLE_VALUE;
+        m_InputDumpDataBytes = 0;
+        m_OutputDumpDataBytes = 0;
+        m_InputDumpDataSizeOffset = 0;
+        m_OutputDumpDataSizeOffset = 0;
+        m_InputDumpBlockAlign = 0;
+        m_OutputDumpBlockAlign = 0;
+        m_HasInputDumpFormat = false;
+        m_HasOutputDumpFormat = false;
+        RtlZeroMemory(&m_InputDumpFormat, sizeof(m_InputDumpFormat));
+        RtlZeroMemory(&m_OutputDumpFormat, sizeof(m_OutputDumpFormat));
+        m_InputDumpPath[0] = L'\0';
+        m_OutputDumpPath[0] = L'\0';
     }
 
     virtual ~CSwapAPOSFX();    // destructor
@@ -272,6 +292,7 @@ public:
     STDMETHOD(LockForProcess)(UINT32 u32NumInputConnections,
         APO_CONNECTION_DESCRIPTOR** ppInputConnections,  
         UINT32 u32NumOutputConnections, APO_CONNECTION_DESCRIPTOR** ppOutputConnections);
+    STDMETHODIMP UnlockForProcess();
 
     STDMETHOD(Initialize)(UINT32 cbDataSize, BYTE* pbyData);
 
@@ -330,6 +351,26 @@ private:
     wil::com_ptr_nothrow<IPropertyStore> m_userStore;
     wil::com_ptr_nothrow<IAudioProcessingObjectLoggingService> m_apoLoggingService;
     BOOL m_bRegisteredEndpointNotificationCallback = FALSE;
+    LONG m_StreamId;
+    LONG m_ApoProcessCallCount;
+    UINT64 m_TotalFramesProcessed;
+    ULONGLONG m_StreamStartTick;
+    UINT64 m_FirstProcessQpc;
+    UINT64 m_LastProcessQpc;
+    HANDLE m_InputDumpFile;
+    HANDLE m_OutputDumpFile;
+    DWORD m_InputDumpDataBytes;
+    DWORD m_OutputDumpDataBytes;
+    DWORD m_InputDumpDataSizeOffset;
+    DWORD m_OutputDumpDataSizeOffset;
+    UINT32 m_InputDumpBlockAlign;
+    UINT32 m_OutputDumpBlockAlign;
+    bool m_HasInputDumpFormat;
+    bool m_HasOutputDumpFormat;
+    WAVEFORMATEXTENSIBLE m_InputDumpFormat;
+    WAVEFORMATEXTENSIBLE m_OutputDumpFormat;
+    WCHAR m_InputDumpPath[MAX_PATH];
+    WCHAR m_OutputDumpPath[MAX_PATH];
 };
 #pragma AVRT_VTABLES_END
 

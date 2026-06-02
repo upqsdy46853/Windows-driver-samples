@@ -22,7 +22,322 @@
 #include <devicetopology.h>
 #include <CustomPropKeys.h>
 #include <propvarutil.h>
+#include <strsafe.h>
 
+static volatile LONG g_NextSfxStreamId = 0;
+
+static void SfxLogF(_In_z_ _Printf_format_string_ PCWSTR format, ...)
+{
+    WCHAR message[1200];
+
+    va_list args;
+    va_start(args, format);
+    StringCchVPrintfW(message, ARRAYSIZE(message), format, args);
+    va_end(args);
+
+    LARGE_INTEGER qpc = {};
+    QueryPerformanceCounter(&qpc);
+
+    WCHAR finalMessage[1600];
+    StringCchPrintfW(
+        finalMessage,
+        ARRAYSIZE(finalMessage),
+        L"[QPC=%lld]%s",
+        qpc.QuadPart,
+        message);
+
+    OutputDebugStringW(finalMessage);
+}
+
+static void GuidToString(
+    _In_ REFGUID guid,
+    _Out_writes_(cchBuffer) PWSTR buffer,
+    UINT cchBuffer)
+{
+    if (StringFromGUID2(guid, buffer, cchBuffer) == 0)
+    {
+        StringCchCopyW(buffer, cchBuffer, L"{GUID_STRING_FAILED}");
+    }
+}
+
+static PCWSTR ProcessingModeToString(_In_ REFGUID processingMode)
+{
+    if (IsEqualGUID(processingMode, GUID_NULL))
+    {
+        return L"GUID_NULL";
+    }
+    if (IsEqualGUID(processingMode, AUDIO_SIGNALPROCESSINGMODE_DEFAULT))
+    {
+        return L"DEFAULT";
+    }
+    if (IsEqualGUID(processingMode, AUDIO_SIGNALPROCESSINGMODE_RAW))
+    {
+        return L"RAW";
+    }
+    if (IsEqualGUID(processingMode, AUDIO_SIGNALPROCESSINGMODE_COMMUNICATIONS))
+    {
+        return L"COMMUNICATIONS";
+    }
+    if (IsEqualGUID(processingMode, AUDIO_SIGNALPROCESSINGMODE_SPEECH))
+    {
+        return L"SPEECH";
+    }
+    if (IsEqualGUID(processingMode, AUDIO_SIGNALPROCESSINGMODE_MEDIA))
+    {
+        return L"MEDIA";
+    }
+    if (IsEqualGUID(processingMode, AUDIO_SIGNALPROCESSINGMODE_MOVIE))
+    {
+        return L"MOVIE";
+    }
+    if (IsEqualGUID(processingMode, AUDIO_SIGNALPROCESSINGMODE_NOTIFICATION))
+    {
+        return L"NOTIFICATION";
+    }
+
+    return L"UNKNOWN";
+}
+
+static bool IsValidDumpFile(HANDLE file)
+{
+    return file != nullptr && file != INVALID_HANDLE_VALUE;
+}
+
+static HRESULT WriteDumpBytes(_In_ HANDLE file, _In_reads_bytes_(bytes) const void* data, DWORD bytes)
+{
+    DWORD written = 0;
+    if (!WriteFile(file, data, bytes, &written, nullptr))
+    {
+        return HRESULT_FROM_WIN32(GetLastError());
+    }
+
+    return written == bytes ? S_OK : HRESULT_FROM_WIN32(ERROR_WRITE_FAULT);
+}
+
+static DWORD WaveFormatBytes(_In_ const WAVEFORMATEX* format)
+{
+    return format->wFormatTag == WAVE_FORMAT_PCM ?
+        sizeof(PCMWAVEFORMAT) :
+        sizeof(WAVEFORMATEX) + format->cbSize;
+}
+
+static HRESULT OpenWaveDumpFile(
+    _In_z_ PCWSTR path,
+    _In_ const WAVEFORMATEX* format,
+    _Out_ HANDLE* file,
+    _Out_ DWORD* dataSizeOffset)
+{
+    LARGE_INTEGER move = {};
+    LARGE_INTEGER position = {};
+
+    *file = INVALID_HANDLE_VALUE;
+    *dataSizeOffset = 0;
+
+    if (format == nullptr)
+    {
+        return E_INVALIDARG;
+    }
+
+    if (!CreateDirectoryW(L"C:\\SwapApoDll", nullptr))
+    {
+        DWORD error = GetLastError();
+        if (error != ERROR_ALREADY_EXISTS)
+        {
+            return HRESULT_FROM_WIN32(error);
+        }
+    }
+
+    HANDLE newFile = CreateFileW(
+        path,
+        GENERIC_WRITE,
+        FILE_SHARE_READ,
+        nullptr,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+
+    if (newFile == INVALID_HANDLE_VALUE)
+    {
+        return HRESULT_FROM_WIN32(GetLastError());
+    }
+
+    const BYTE riff[] = { 'R', 'I', 'F', 'F' };
+    const BYTE wave[] = { 'W', 'A', 'V', 'E' };
+    const BYTE fmt[] = { 'f', 'm', 't', ' ' };
+    const BYTE data[] = { 'd', 'a', 't', 'a' };
+    const DWORD zero = 0;
+    const DWORD formatBytes = WaveFormatBytes(format);
+
+    HRESULT hr = WriteDumpBytes(newFile, riff, sizeof(riff));
+    IF_FAILED_JUMP(hr, Exit);
+    hr = WriteDumpBytes(newFile, &zero, sizeof(zero));
+    IF_FAILED_JUMP(hr, Exit);
+    hr = WriteDumpBytes(newFile, wave, sizeof(wave));
+    IF_FAILED_JUMP(hr, Exit);
+    hr = WriteDumpBytes(newFile, fmt, sizeof(fmt));
+    IF_FAILED_JUMP(hr, Exit);
+    hr = WriteDumpBytes(newFile, &formatBytes, sizeof(formatBytes));
+    IF_FAILED_JUMP(hr, Exit);
+    hr = WriteDumpBytes(newFile, format, formatBytes);
+    IF_FAILED_JUMP(hr, Exit);
+    hr = WriteDumpBytes(newFile, data, sizeof(data));
+    IF_FAILED_JUMP(hr, Exit);
+
+    if (!SetFilePointerEx(newFile, move, &position, FILE_CURRENT))
+    {
+        hr = HRESULT_FROM_WIN32(GetLastError());
+        goto Exit;
+    }
+
+    *dataSizeOffset = static_cast<DWORD>(position.QuadPart);
+    hr = WriteDumpBytes(newFile, &zero, sizeof(zero));
+    IF_FAILED_JUMP(hr, Exit);
+
+    *file = newFile;
+    newFile = INVALID_HANDLE_VALUE;
+
+Exit:
+    if (newFile != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(newFile);
+    }
+    return hr;
+}
+
+static void FinishWaveDumpFile(_Inout_ HANDLE* file, DWORD dataBytes, DWORD dataSizeOffset, _In_opt_z_ PCWSTR path)
+{
+    if (!IsValidDumpFile(*file))
+    {
+        return;
+    }
+
+    if (dataBytes != 0)
+    {
+        DWORD riffSize = dataSizeOffset - sizeof(DWORD) + dataBytes;
+        LARGE_INTEGER position = {};
+        DWORD written = 0;
+
+        position.QuadPart = sizeof(DWORD);
+        if (SetFilePointerEx(*file, position, nullptr, FILE_BEGIN))
+        {
+            WriteFile(*file, &riffSize, sizeof(riffSize), &written, nullptr);
+        }
+
+        position.QuadPart = dataSizeOffset;
+        if (SetFilePointerEx(*file, position, nullptr, FILE_BEGIN))
+        {
+            WriteFile(*file, &dataBytes, sizeof(dataBytes), &written, nullptr);
+        }
+    }
+
+    CloseHandle(*file);
+    *file = INVALID_HANDLE_VALUE;
+
+    if (dataBytes == 0 && path != nullptr && path[0] != L'\0')
+    {
+        DeleteFileW(path);
+    }
+}
+
+static void WriteWaveDumpFrameBytes(_In_ HANDLE file, _In_reads_bytes_(bytes) const void* data, DWORD bytes, _Inout_ DWORD* dataBytes)
+{
+    if (!IsValidDumpFile(file) || data == nullptr || bytes == 0)
+    {
+        return;
+    }
+
+    if (*dataBytes > MAXDWORD - bytes)
+    {
+        return;
+    }
+
+    if (SUCCEEDED(WriteDumpBytes(file, data, bytes)))
+    {
+        *dataBytes += bytes;
+    }
+}
+
+static bool CopyWaveDumpFormat(_In_ const WAVEFORMATEX* source, _Out_ WAVEFORMATEXTENSIBLE* destination)
+{
+    if (source == nullptr || destination == nullptr)
+    {
+        return false;
+    }
+
+    DWORD formatBytes = WaveFormatBytes(source);
+    if (formatBytes == 0 || formatBytes > sizeof(WAVEFORMATEXTENSIBLE))
+    {
+        return false;
+    }
+
+    RtlZeroMemory(destination, sizeof(*destination));
+    CopyMemory(destination, source, formatBytes);
+    return true;
+}
+
+static void EnsureWaveDumpFile(
+    _In_z_ PCWSTR path,
+    _In_ const WAVEFORMATEXTENSIBLE* format,
+    _Inout_ bool* hasFormat,
+    _Inout_ HANDLE* file,
+    _Inout_ DWORD* dataSizeOffset)
+{
+    if (IsValidDumpFile(*file) ||
+        hasFormat == nullptr ||
+        !*hasFormat ||
+        path == nullptr ||
+        path[0] == L'\0' ||
+        format == nullptr)
+    {
+        return;
+    }
+
+    HRESULT hr = OpenWaveDumpFile(
+        path,
+        reinterpret_cast<const WAVEFORMATEX*>(format),
+        file,
+        dataSizeOffset);
+
+    if (FAILED(hr))
+    {
+        *hasFormat = false;
+    }
+}
+
+static bool FloatBufferHasNonzeroSample(_In_reads_(sampleCount) const FLOAT32* samples, UINT32 sampleCount)
+{
+    if (samples == nullptr)
+    {
+        return false;
+    }
+
+    for (UINT32 sampleIndex = 0; sampleIndex < sampleCount; ++sampleIndex)
+    {
+        if (samples[sampleIndex] != 0.0f)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void BuildWaveDumpPath(
+    _Out_writes_(pathCch) PWSTR path,
+    UINT pathCch,
+    _In_z_ PCWSTR direction,
+    LONG streamId)
+{
+    LARGE_INTEGER qpc = {};
+    QueryPerformanceCounter(&qpc);
+    StringCchPrintfW(
+        path,
+        pathCch,
+        L"C:\\SwapApoDll\\SwapAPOSFX_Stream%ld_QPC%lld_%s.wav",
+        streamId,
+        qpc.QuadPart,
+        direction);
+}
 
 // Static declaration of the APO_REG_PROPERTIES structure
 // associated with this APO.  The number in <> brackets is the
@@ -112,11 +427,56 @@ STDMETHODIMP_(void) CSwapAPOSFX::APOProcess(
             pf32OutputFrames = reinterpret_cast<FLOAT32*>(ppOutputConnections[0]->pBuffer);
             ATLASSERT( IS_VALID_TYPED_WRITE_POINTER(pf32OutputFrames) );
 
+            LARGE_INTEGER processQpc = {};
+            QueryPerformanceCounter(&processQpc);
+
+            InterlockedIncrement(&m_ApoProcessCallCount);
+            m_TotalFramesProcessed += ppInputConnections[0]->u32ValidFrameCount;
+
+            if (m_FirstProcessQpc == 0)
+            {
+                m_FirstProcessQpc = static_cast<UINT64>(processQpc.QuadPart);
+            }
+            m_LastProcessQpc = static_cast<UINT64>(processQpc.QuadPart);
+
+            const bool dumpThisBuffer =
+                ppInputConnections[0]->u32BufferFlags == BUFFER_VALID &&
+                ppInputConnections[0]->u32ValidFrameCount != 0;
+            const UINT64 inputSampleCount =
+                static_cast<UINT64>(ppInputConnections[0]->u32ValidFrameCount) *
+                GetSamplesPerFrame();
+            const bool inputHasSignal =
+                dumpThisBuffer &&
+                inputSampleCount <= 0xFFFFFFFFui64 &&
+                FloatBufferHasNonzeroSample(
+                    pf32InputFrames,
+                    static_cast<UINT32>(inputSampleCount));
+
             if (BUFFER_SILENT == ppInputConnections[0]->u32BufferFlags)
             {
                 WriteSilence( pf32InputFrames,
                               ppInputConnections[0]->u32ValidFrameCount,
                               GetSamplesPerFrame() );
+            }
+
+            if (dumpThisBuffer && (inputHasSignal || IsValidDumpFile(m_InputDumpFile)))
+            {
+                EnsureWaveDumpFile(
+                    m_InputDumpPath,
+                    &m_InputDumpFormat,
+                    &m_HasInputDumpFormat,
+                    &m_InputDumpFile,
+                    &m_InputDumpDataSizeOffset);
+
+                UINT64 inputBytes = static_cast<UINT64>(ppInputConnections[0]->u32ValidFrameCount) * m_InputDumpBlockAlign;
+                if (inputBytes <= MAXDWORD)
+                {
+                    WriteWaveDumpFrameBytes(
+                        m_InputDumpFile,
+                        pf32InputFrames,
+                        static_cast<DWORD>(inputBytes),
+                        &m_InputDumpDataBytes);
+                }
             }
 
             // swap the input buffer in-place
@@ -144,6 +504,26 @@ STDMETHODIMP_(void) CSwapAPOSFX::APOProcess(
 
             // Set the valid frame count.
             ppOutputConnections[0]->u32ValidFrameCount = ppInputConnections[0]->u32ValidFrameCount;
+
+            if (dumpThisBuffer && (inputHasSignal || IsValidDumpFile(m_OutputDumpFile)))
+            {
+                EnsureWaveDumpFile(
+                    m_OutputDumpPath,
+                    &m_OutputDumpFormat,
+                    &m_HasOutputDumpFormat,
+                    &m_OutputDumpFile,
+                    &m_OutputDumpDataSizeOffset);
+
+                UINT64 outputBytes = static_cast<UINT64>(ppOutputConnections[0]->u32ValidFrameCount) * m_OutputDumpBlockAlign;
+                if (outputBytes <= MAXDWORD)
+                {
+                    WriteWaveDumpFrameBytes(
+                        m_OutputDumpFile,
+                        pf32OutputFrames,
+                        static_cast<DWORD>(outputBytes),
+                        &m_OutputDumpDataBytes);
+                }
+            }
 
             break;
         }
@@ -206,14 +586,119 @@ STDMETHODIMP CSwapAPOSFX::LockForProcess(UINT32 u32NumInputConnections,
     APO_CONNECTION_DESCRIPTOR** ppInputConnections,  
     UINT32 u32NumOutputConnections, APO_CONNECTION_DESCRIPTOR** ppOutputConnections)
 {
+    FinishWaveDumpFile(&m_InputDumpFile, m_InputDumpDataBytes, m_InputDumpDataSizeOffset, m_InputDumpPath);
+    FinishWaveDumpFile(&m_OutputDumpFile, m_OutputDumpDataBytes, m_OutputDumpDataSizeOffset, m_OutputDumpPath);
+
+    m_StreamId = InterlockedIncrement(&g_NextSfxStreamId);
+    m_ApoProcessCallCount = 0;
+    m_TotalFramesProcessed = 0;
+    m_StreamStartTick = GetTickCount64();
+    m_FirstProcessQpc = 0;
+    m_LastProcessQpc = 0;
+    m_InputDumpDataBytes = 0;
+    m_OutputDumpDataBytes = 0;
+    m_InputDumpDataSizeOffset = 0;
+    m_OutputDumpDataSizeOffset = 0;
+    m_InputDumpBlockAlign = 0;
+    m_OutputDumpBlockAlign = 0;
+    m_HasInputDumpFormat = false;
+    m_HasOutputDumpFormat = false;
+    RtlZeroMemory(&m_InputDumpFormat, sizeof(m_InputDumpFormat));
+    RtlZeroMemory(&m_OutputDumpFormat, sizeof(m_OutputDumpFormat));
+    m_InputDumpPath[0] = L'\0';
+    m_OutputDumpPath[0] = L'\0';
+
     ASSERT_NONREALTIME();
     HRESULT hr = S_OK;
     
     hr = CBaseAudioProcessingObject::LockForProcess(u32NumInputConnections,
         ppInputConnections, u32NumOutputConnections, ppOutputConnections);
     IF_FAILED_JUMP(hr, Exit);
+
+    if (ppInputConnections != nullptr && ppInputConnections[0] != nullptr &&
+        ppInputConnections[0]->pFormat != nullptr)
+    {
+        const WAVEFORMATEX* inputFormat = ppInputConnections[0]->pFormat->GetAudioFormat();
+        if (inputFormat != nullptr)
+        {
+            m_InputDumpBlockAlign = inputFormat->nBlockAlign;
+            if (CopyWaveDumpFormat(inputFormat, &m_InputDumpFormat))
+            {
+                BuildWaveDumpPath(m_InputDumpPath, ARRAYSIZE(m_InputDumpPath), L"IN", m_StreamId);
+                m_HasInputDumpFormat = true;
+            }
+        }
+    }
+
+    if (ppOutputConnections != nullptr && ppOutputConnections[0] != nullptr &&
+        ppOutputConnections[0]->pFormat != nullptr)
+    {
+        const WAVEFORMATEX* outputFormat = ppOutputConnections[0]->pFormat->GetAudioFormat();
+        if (outputFormat != nullptr)
+        {
+            m_OutputDumpBlockAlign = outputFormat->nBlockAlign;
+            if (CopyWaveDumpFormat(outputFormat, &m_OutputDumpFormat))
+            {
+                BuildWaveDumpPath(m_OutputDumpPath, ARRAYSIZE(m_OutputDumpPath), L"OUT", m_StreamId);
+                m_HasOutputDumpFormat = true;
+            }
+        }
+    }
     
 Exit:
+    SfxLogF(
+        L"[Type=SFX][Instance=0x%p][StreamId=%ld][Event=LockForProcessLeave][PID=%lu][TID=%lu][HR=0x%08X][DumpInReady=%u][DumpOutReady=%u]\n",
+        this,
+        m_StreamId,
+        GetCurrentProcessId(),
+        GetCurrentThreadId(),
+        hr,
+        m_HasInputDumpFormat ? 1 : 0,
+        m_HasOutputDumpFormat ? 1 : 0);
+
+    return hr;
+}
+
+STDMETHODIMP CSwapAPOSFX::UnlockForProcess()
+{
+    ULONGLONG now = GetTickCount64();
+
+    ULONGLONG streamDurationMs = 0;
+    if (m_StreamStartTick != 0)
+    {
+        streamDurationMs = now - m_StreamStartTick;
+    }
+
+    ULONGLONG processingDurationMs = 0;
+    if (m_FirstProcessQpc != 0 && m_LastProcessQpc >= m_FirstProcessQpc)
+    {
+        LARGE_INTEGER qpcFrequency = {};
+        if (QueryPerformanceFrequency(&qpcFrequency) && qpcFrequency.QuadPart != 0)
+        {
+            processingDurationMs =
+                ((m_LastProcessQpc - m_FirstProcessQpc) * 1000) /
+                static_cast<UINT64>(qpcFrequency.QuadPart);
+        }
+    }
+
+    SfxLogF(
+        L"[Type=SFX][Instance=0x%p][StreamId=%ld][Event=StreamSummary][StreamDurationMs=%llu][ProcessingDurationMs=%llu][FirstProcessQPC=%llu][LastProcessQPC=%llu][ProcessCalls=%ld][TotalFrames=%llu][DumpInBytes=%lu][DumpOutBytes=%lu]\n",
+        this,
+        m_StreamId,
+        streamDurationMs,
+        processingDurationMs,
+        m_FirstProcessQpc,
+        m_LastProcessQpc,
+        m_ApoProcessCallCount,
+        m_TotalFramesProcessed,
+        m_InputDumpDataBytes,
+        m_OutputDumpDataBytes);
+
+    HRESULT hr = CBaseAudioProcessingObject::UnlockForProcess();
+
+    FinishWaveDumpFile(&m_InputDumpFile, m_InputDumpDataBytes, m_InputDumpDataSizeOffset, m_InputDumpPath);
+    FinishWaveDumpFile(&m_OutputDumpFile, m_OutputDumpDataBytes, m_OutputDumpDataSizeOffset, m_OutputDumpPath);
+
     return hr;
 }
 
@@ -284,7 +769,11 @@ HRESULT CSwapAPOSFX::Initialize(UINT32 cbDataSize, BYTE* pbyData)
     HRESULT                     hr = S_OK;
     CComPtr<IDeviceTopology>    spMyDeviceTopology;
     CComPtr<IConnector>         spMyConnector;
-    GUID                        processingMode;
+    GUID                        processingMode = AUDIO_SIGNALPROCESSINGMODE_DEFAULT;
+    BOOL                        initializeForDiscoveryOnly = FALSE;
+    UINT32                      deviceCountForLog = 0;
+    UINT                        softwareIoDeviceForLog = 0;
+    UINT                        softwareIoConnectorForLog = 0;
 
     IF_TRUE_ACTION_JUMP( ((NULL == pbyData) && (0 != cbDataSize)), hr = E_INVALIDARG, Exit);
     IF_TRUE_ACTION_JUMP( ((NULL != pbyData) && (0 == cbDataSize)), hr = E_INVALIDARG, Exit);
@@ -292,6 +781,9 @@ HRESULT CSwapAPOSFX::Initialize(UINT32 cbDataSize, BYTE* pbyData)
     if (cbDataSize == sizeof(APOInitSystemEffects3))
     {
         APOInitSystemEffects3* papoSysFxInit3 = (APOInitSystemEffects3*)pbyData;
+        initializeForDiscoveryOnly = papoSysFxInit3->InitializeForDiscoveryOnly;
+        softwareIoDeviceForLog = papoSysFxInit3->nSoftwareIoDeviceInCollection;
+        softwareIoConnectorForLog = papoSysFxInit3->nSoftwareIoConnectorIndex;
 
         // Try to get the logging service, but ignore errors as failure to do logging it is not fatal.
         hr = papoSysFxInit3->pServiceProvider->QueryService(SID_AudioProcessingObjectLoggingService, IID_PPV_ARGS(&m_apoLoggingService));
@@ -312,6 +804,7 @@ HRESULT CSwapAPOSFX::Initialize(UINT32 cbDataSize, BYTE* pbyData)
         // (It is the last device in the device collection)
         hr = deviceCollection->GetCount(&numDevices);
         IF_FAILED_JUMP(hr, Exit);
+        deviceCountForLog = numDevices;
 
         hr = numDevices > 0 ? S_OK : E_UNEXPECTED;
         IF_FAILED_JUMP(hr, Exit);
@@ -353,6 +846,8 @@ HRESULT CSwapAPOSFX::Initialize(UINT32 cbDataSize, BYTE* pbyData)
         // Initialize for mode-specific signal processing
         //
         APOInitSystemEffects2* papoSysFxInit2 = (APOInitSystemEffects2*)pbyData;
+        softwareIoDeviceForLog = papoSysFxInit2->nSoftwareIoDeviceInCollection;
+        softwareIoConnectorForLog = papoSysFxInit2->nSoftwareIoConnectorIndex;
 
         // Save reference to the effects property store. This saves effects settings
         // and is the communication medium between this APO and any associated UI.
@@ -361,6 +856,7 @@ HRESULT CSwapAPOSFX::Initialize(UINT32 cbDataSize, BYTE* pbyData)
         // Windows should pass a valid collection.
         ATLASSERT(papoSysFxInit2->pDeviceCollection != nullptr);
         IF_TRUE_ACTION_JUMP(papoSysFxInit2->pDeviceCollection == nullptr, hr = E_INVALIDARG, Exit);
+        (void)papoSysFxInit2->pDeviceCollection->GetCount(&deviceCountForLog);
 
         // Get the IDeviceTopology and IConnector interfaces to communicate with this
         // APO's counterpart audio driver. This can be used for any proprietary
@@ -432,7 +928,21 @@ HRESULT CSwapAPOSFX::Initialize(UINT32 cbDataSize, BYTE* pbyData)
     {
         m_fEnableSwapSFX = GetCurrentEffectsSetting(m_spAPOSystemEffectsProperties, PKEY_Endpoint_Enable_Channel_Swap_SFX, m_AudioProcessingMode);
     }
-    
+
+    WCHAR processingModeGuid[64] = {};
+    GuidToString(m_AudioProcessingMode, processingModeGuid, ARRAYSIZE(processingModeGuid));
+
+    SfxLogF(
+        L"[Type=SFX][Instance=0x%p][Event=InitializeContext][AudioProcessingModeName=%s][AudioProcessingMode=%s][InitializeForDiscoveryOnly=%u][DeviceCount=%u][SoftwareIoDevice=%u][SoftwareIoConnector=%u][SwapEnabled=%ld]\n",
+        this,
+        ProcessingModeToString(m_AudioProcessingMode),
+        processingModeGuid,
+        initializeForDiscoveryOnly,
+        deviceCountForLog,
+        softwareIoDeviceForLog,
+        softwareIoConnectorForLog,
+        m_fEnableSwapSFX);
+
     RtlZeroMemory(m_effectInfos, sizeof(m_effectInfos));
     m_effectInfos[0] = { SwapEffectId, TRUE, m_fEnableSwapSFX ? AUDIO_SYSTEMEFFECT_STATE_ON : AUDIO_SYSTEMEFFECT_STATE_OFF };
 
@@ -807,6 +1317,9 @@ void CSwapAPOSFX::HandleNotification(APO_NOTIFICATION *apoNotification)
 //
 CSwapAPOSFX::~CSwapAPOSFX(void)
 {
+    FinishWaveDumpFile(&m_InputDumpFile, m_InputDumpDataBytes, m_InputDumpDataSizeOffset, m_InputDumpPath);
+    FinishWaveDumpFile(&m_OutputDumpFile, m_OutputDumpDataBytes, m_OutputDumpDataSizeOffset, m_OutputDumpPath);
+
     //
     // unregister for callbacks
     //
